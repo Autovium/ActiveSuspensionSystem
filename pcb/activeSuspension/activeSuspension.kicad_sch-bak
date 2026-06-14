@@ -3582,16 +3582,6 @@
 	)
 	(wire
 		(pts
-			(xy 85.09 35.56) (xy 76.2 35.56)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "66c48c77-4b90-4b4a-9e4d-2b7691339fc0")
-	)
-	(wire
-		(pts
 			(xy 67.31 137.16) (xy 58.42 137.16)
 		)
 		(stroke
@@ -4199,16 +4189,6 @@
 			(type default)
 		)
 		(uuid "c5a9f3e9-6458-4182-a18c-0ca3493bb404")
-	)
-	(wire
-		(pts
-			(xy 77.47 38.1) (xy 76.2 38.1)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "c65b3802-d8f8-4468-a9b6-4608518027c1")
 	)
 	(wire
 		(pts
@@ -6370,7 +6350,7 @@
 	)
 	(global_label "PWM3"
 		(shape input)
-		(at 83.82 50.8 0)
+		(at 82.55 50.8 0)
 		(fields_autoplaced yes)
 		(effects
 			(font
@@ -6380,7 +6360,7 @@
 		)
 		(uuid "87499356-961c-44b8-bef0-1cfe074088c0")
 		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 92.1875 50.8 0)
+			(at 90.9175 50.8 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -6390,7 +6370,7 @@
 			)
 		)
 		(property "3.3V" ""
-			(at 83.82 52.9908 0)
+			(at 82.55 52.9908 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -7788,38 +7768,6 @@
 			)
 		)
 	)
-	(global_label "DT3"
-		(shape input)
-		(at 85.09 35.56 0)
-		(fields_autoplaced yes)
-		(effects
-			(font
-				(size 1.27 1.27)
-			)
-			(justify left)
-		)
-		(uuid "d4046b88-b799-4551-9f28-b52c78ba3701")
-		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 91.5223 35.56 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-				(hide yes)
-			)
-		)
-		(property "3.3V" ""
-			(at 85.09 37.7508 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-				(hide yes)
-			)
-		)
-	)
 	(global_label "SCL"
 		(shape input)
 		(at 223.52 88.9 0)
@@ -8387,38 +8335,6 @@
 		)
 		(property "3.3V" ""
 			(at 184.15 113.9508 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-				(hide yes)
-			)
-		)
-	)
-	(global_label "SCK3"
-		(shape input)
-		(at 77.47 38.1 0)
-		(fields_autoplaced yes)
-		(effects
-			(font
-				(size 1.27 1.27)
-			)
-			(justify left)
-		)
-		(uuid "f221a5d1-fe06-4ca1-83f0-2420964012f9")
-		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 85.4142 38.1 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-				(hide yes)
-			)
-		)
-		(property "3.3V" ""
-			(at 77.47 40.2908 0)
 			(effects
 				(font
 					(size 1.27 1.27)
