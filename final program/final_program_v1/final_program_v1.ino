@@ -184,7 +184,7 @@ void updateIMU() {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
     
-    // Kept your inverted roll orientation logic unchanged
+    // Custom inverted roll feedback applied
     float raw_roll  = (-atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI);
     float raw_pitch = (atan2(a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI);
     
@@ -278,8 +278,9 @@ void processKinematics() {
     float cmd_roll  = (target_roll >= 0)  ? (target_roll * GEOMETRY_ROLL_MULT_POS)   : (target_roll * GEOMETRY_ROLL_MULT_NEG);
 
     // 2. Calculate Closed-Loop Auto-Leveling
-    float imu_pitch = (target_pitch - curr_pitch) * Kp_IMU_Pitch;
-    float imu_roll  = (target_roll - curr_roll) * Kp_IMU_Roll;
+    // FIX: (current - target) to provide negative feedback and prevent positive loop bucking
+    float imu_pitch = (curr_pitch - target_pitch) * Kp_IMU_Pitch;
+    float imu_roll  = (curr_roll - target_roll) * Kp_IMU_Roll;
 
     // Combine adjustments
     float total_pitch = cmd_pitch + imu_pitch;
