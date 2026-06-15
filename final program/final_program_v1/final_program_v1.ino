@@ -33,6 +33,10 @@
 #define MOTOR_IN2 14
 #define MOTOR_EN  11
 
+// External Speed Selection Pins
+#define PIN_SPEED_SEL_0 40
+#define PIN_SPEED_SEL_1 41
+
 // PWM Properties for Motor
 const int pwmFreq = 5000;    // 5kHz
 const int pwmResolution = 8; // 8-bit (0-255)
@@ -108,10 +112,6 @@ struct SuccessiveAverage {
     }
 };
 
-// Window sizes for averaging:
-// 10 for IMU for smooth leveling (Reduced from 100 to completely eliminate Phase Lag oscillations!)
-// 1 for ToF for INSTANT reaction to obstacles (zero software delay)
-// 1 for Load cells for INSTANT impact detection
 SuccessiveAverage<10> pitch_avg;
 SuccessiveAverage<10> roll_avg;
 SuccessiveAverage<1> tof_avg[4];  
@@ -130,6 +130,7 @@ Adafruit_VL53L0X tofBR = Adafruit_VL53L0X();
 
 bool mpu_ready = false;
 bool tof_ready[4] = {false, false, false, false}; // FL, FR, BL, BR
+bool motor_enabled = false; // Safety lockout state
 
 // Baselines calculated at startup
 float IMU_PITCH_OFFSET = 0.0, IMU_ROLL_OFFSET = 0.0;
@@ -183,6 +184,7 @@ void updateIMU() {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
     
+    // Kept your inverted roll orientation logic unchanged
     float raw_roll  = (-atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI);
     float raw_pitch = (atan2(a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI);
     
@@ -244,14 +246,38 @@ void updateLoadCells() {
 }
 
 // ==========================================
-// 7. OPEN-LOOP KINEMATICS ENGINE -> UPGRADED TO CLOSED-LOOP!
+// 6.5 DRIVE MOTOR SPEED CONTROL
+// ==========================================
+void updateMotorSpeed() {
+    if (!motor_enabled) return; // Prevent actuation if safety lockout is active
+
+    bool sel0 = digitalRead(PIN_SPEED_SEL_0);
+    bool sel1 = digitalRead(PIN_SPEED_SEL_1);
+    
+    int pwm_val = 0;
+
+    if (!sel0 && !sel1) {
+        pwm_val = 0;      // 0%
+    } else if (sel0 && !sel1) {
+        pwm_val = 64;     // 25% (255 * 0.25 = 63.75)
+    } else if (!sel0 && sel1) {
+        pwm_val = 127;    // 50% (255 * 0.50 = 127.5)
+    } else if (sel0 && sel1) {
+        pwm_val = 191;    // 75% (255 * 0.75 = 191.25)
+    }
+
+    ledcWrite(MOTOR_EN, pwm_val);
+}
+
+// ==========================================
+// 7. CLOSED-LOOP KINEMATICS ENGINE
 // ==========================================
 void processKinematics() {
-    // 1. Calculate Feed-Forward User Commands (Using the aggressive geometry multipliers)
+    // 1. Calculate Feed-Forward User Commands
     float cmd_pitch = (target_pitch >= 0) ? (target_pitch * GEOMETRY_PITCH_MULT_POS) : (target_pitch * GEOMETRY_PITCH_MULT_NEG);
     float cmd_roll  = (target_roll >= 0)  ? (target_roll * GEOMETRY_ROLL_MULT_POS)   : (target_roll * GEOMETRY_ROLL_MULT_NEG);
 
-    // 2. Calculate Closed-Loop Auto-Leveling (Using gentle stabilization multipliers to prevent oscillation)
+    // 2. Calculate Closed-Loop Auto-Leveling
     float imu_pitch = (target_pitch - curr_pitch) * Kp_IMU_Pitch;
     float imu_roll  = (target_roll - curr_roll) * Kp_IMU_Roll;
 
@@ -274,19 +300,15 @@ void processKinematics() {
             // Proactive Terrain Mapping (ToF)
             float tof_diff = BASE_TOF[i] - curr_tof[i];
             if (tof_diff > TOF_DEADBAND) { 
-                // Distance decreased -> Bump approaching -> Retract leg (Positive offset)
                 tof_offset = (tof_diff - TOF_DEADBAND) * Kp_ToF_Terrain;
             } else if (tof_diff < -TOF_DEADBAND) {
-                // Distance increased -> Hole approaching -> Extend leg (Negative offset)
                 tof_offset = (tof_diff + TOF_DEADBAND) * Kp_ToF_Terrain;
             }
 
             // Reactive Shock Absorption (Load Cells)
             if (curr_load[i] < -LOAD_DEADBAND) { 
-                // Weight lost -> Wheel fell into a hole -> Extend leg downwards (Negative offset)
                 load_offset = -abs(curr_load[i] + LOAD_DEADBAND) * Kp_Load_Extend;
             } else if (curr_load[i] > LOAD_DEADBAND) { 
-                // Weight spiked -> Wheel hit a bump -> Retract leg to absorb impact (Positive offset)
                 load_offset = abs(curr_load[i] - LOAD_DEADBAND) * Kp_Load_Retract;
             }
 
@@ -324,11 +346,14 @@ void processKinematics() {
 void setup() {
     Serial.begin(115200);
     Wire.begin(SDA_PIN, SCL_PIN); 
-    // Reduced to 100kHz for stability over long wires to ToF sensors
     Wire.setClock(100000); 
     delay(1000);
     
     Serial.println("System Booting... Independent Active Suspension");
+
+    // --- Switch Inputs Initialization ---
+    pinMode(PIN_SPEED_SEL_0, INPUT_PULLDOWN);
+    pinMode(PIN_SPEED_SEL_1, INPUT_PULLDOWN);
 
     // --- Servos Initialization ---
     ESP32PWM::allocateTimer(0);
@@ -339,22 +364,10 @@ void setup() {
     
     Serial.println("Moving actuators to HOME position before IMU calibration...");
     
-    // Staggered Startup to prevent ESP32 Brownout
-    fl.attach(PIN_FL_SERVO);
-    fl.write(180 - BASE_ANGLE_FRONT);
-    delay(250); 
-    
-    fr.attach(PIN_FR_SERVO);
-    fr.write(BASE_ANGLE_FRONT);
-    delay(250);
-    
-    bl.attach(PIN_BL_SERVO);
-    bl.write(BASE_ANGLE_BACK);
-    delay(250);
-    
-    br.attach(PIN_BR_SERVO);
-    br.write(180 - BASE_ANGLE_BACK);
-    
+    fl.attach(PIN_FL_SERVO); fl.write(180 - BASE_ANGLE_FRONT); delay(250); 
+    fr.attach(PIN_FR_SERVO); fr.write(BASE_ANGLE_FRONT);       delay(250);
+    bl.attach(PIN_BL_SERVO); bl.write(BASE_ANGLE_BACK);        delay(250);
+    br.attach(PIN_BR_SERVO); br.write(180 - BASE_ANGLE_BACK);
     delay(1250); 
 
     // --- Drive Motor (L298N) Initialization ---
@@ -394,32 +407,13 @@ void setup() {
     // --- ToF Sensors ---
     Serial.println("Initializing ToF Sensors (HIGH SPEED MODE)...");
     tcaSelect(0); 
-    if (tofFL.begin()) { 
-        tofFL.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); 
-        tof_ready[0] = true; 
-        Serial.println("ToF FL: OK"); 
-    } else { Serial.println("ToF FL: FAILED"); }
-    
+    if (tofFL.begin()) { tofFL.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); tof_ready[0] = true; Serial.println("ToF FL: OK"); } else { Serial.println("ToF FL: FAILED"); }
     tcaSelect(3); 
-    if (tofFR.begin()) { 
-        tofFR.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); 
-        tof_ready[1] = true; 
-        Serial.println("ToF FR: OK"); 
-    } else { Serial.println("ToF FR: FAILED"); }
-    
+    if (tofFR.begin()) { tofFR.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); tof_ready[1] = true; Serial.println("ToF FR: OK"); } else { Serial.println("ToF FR: FAILED"); }
     tcaSelect(1); 
-    if (tofBL.begin()) { 
-        tofBL.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); 
-        tof_ready[2] = true; 
-        Serial.println("ToF BL: OK"); 
-    } else { Serial.println("ToF BL: FAILED"); }
-    
+    if (tofBL.begin()) { tofBL.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); tof_ready[2] = true; Serial.println("ToF BL: OK"); } else { Serial.println("ToF BL: FAILED"); }
     tcaSelect(2); 
-    if (tofBR.begin()) { 
-        tofBR.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); 
-        tof_ready[3] = true; 
-        Serial.println("ToF BR: OK"); 
-    } else { Serial.println("ToF BR: FAILED"); }
+    if (tofBR.begin()) { tofBR.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); tof_ready[3] = true; Serial.println("ToF BR: OK"); } else { Serial.println("ToF BR: FAILED"); }
     
     Serial.println("Calibrating ToF Baselines...");
     VL53L0X_RangingMeasurementData_t measure;
@@ -472,18 +466,19 @@ void setup() {
     bool FORCE_MOTOR_RUN = true; 
     
     if ((mpu_ready && all_tofs_intact && lc_ready) || FORCE_MOTOR_RUN) {
-        Serial.println("STATUS: INTACT (Or Forced) - Starting Drive Motor...");
+        Serial.println("STATUS: INTACT (Or Forced) - Starting Drive Motor Logic...");
         
         digitalWrite(MOTOR_IN1, HIGH);
         digitalWrite(MOTOR_IN2, LOW);
-        
-        ledcWrite(MOTOR_EN, 150); 
+        motor_enabled = true; // Clear the lockout
+        updateMotorSpeed();   // Set initial speed based on switches
     } else {
         Serial.println("STATUS: DEGRADED - One or more sensors failed to initialize.");
         Serial.println("SAFETY LOCKOUT: Drive Motor will remain STOPPED. (Set FORCE_MOTOR_RUN=true to bypass)");
         digitalWrite(MOTOR_IN1, LOW); 
         digitalWrite(MOTOR_IN2, LOW); 
         ledcWrite(MOTOR_EN, 0); 
+        motor_enabled = false; // Engage lockout
     }
 
     Serial.println("--- SYSTEM ONLINE ---");
@@ -496,7 +491,7 @@ void setup() {
 void loop() {
     unsigned long currentMillis = millis();
 
-    // 1. Handle Serial Commands (Non-Blocking)
+    // 1. Handle Serial Commands
     if (Serial.available() > 0) {
         String input = Serial.readStringUntil('\n');
         input.trim();
@@ -533,18 +528,19 @@ void loop() {
         }
     }
 
-    // 2. Update Sensors (For Observation and Overrides)
+    // 2. Update Sensors
     updateIMU();
     updateToFRoundRobin();
     updateLoadCells();
+    updateMotorSpeed(); // Continuously poll switches for dynamic speed adjustment
 
-    // 3. Process Kinematics & Update Servos (~66Hz loop)
+    // 3. Process Kinematics (~66Hz loop)
     if (currentMillis - lastControlTime >= 15) {
         lastControlTime = currentMillis;
         processKinematics();
     }
 
-    // 4. Debug Diagnostics / Serial Plotter
+    // 4. Debug Diagnostics
     unsigned long diag_interval = plotter_mode ? PLOT_INTERVAL : DIAG_INTERVAL;
     if (currentMillis - lastDiagTime >= diag_interval) {
         lastDiagTime = currentMillis;
