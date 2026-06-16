@@ -1,79 +1,12 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <Adafruit_VL53L0X.h>
-#include <HX711.h>
-#include <math.h>
 
 // ==========================================
-// 1. PIN DEFINITIONS & CONSTANTS
-// ==========================================
-#define SDA_PIN 1
-#define SCL_PIN 2
-#define TCAADDR 0x70
-
-#define PIN_FL_SERVO 12
-#define PIN_FR_SERVO 42
-#define PIN_BL_SERVO 47
-#define PIN_BR_SERVO 21
-
-#define FL_DT 5
-#define FL_SCK 4
-#define FR_DT 38
-#define FR_SCK 39
-#define BL_DT 6
-#define BL_SCK 7
-#define BR_DT 36
-#define BR_SCK 35
-
-// L298N Motor Pins
-#define MOTOR_IN1 13
-#define MOTOR_IN2 14
-#define MOTOR_EN  11
-
-// External Speed Selection Pins
-#define PIN_SPEED_SEL_0 40
-#define PIN_SPEED_SEL_1 41
-
-// PWM Properties for Motor
-const int pwmFreq = 5000;    // 5kHz
-const int pwmResolution = 8; // 8-bit (0-255)
-
-// ==========================================
-// 2. KINEMATIC GEOMETRY CONSTANTS
-// ==========================================
-const float GEOMETRY_PITCH_MULT_POS = -5.1; 
-const float GEOMETRY_PITCH_MULT_NEG = -4.0; 
-
-const float GEOMETRY_ROLL_MULT_POS = 8.7;   
-const float GEOMETRY_ROLL_MULT_NEG = 4.1;   
-
-const float MAX_ANGLE_STEP = 90.0; // Increased to 90 to remove software speed limits (INSTANT SNAPPING)
-
-// ==========================================
-// 2.5 ACTIVE SUSPENSION TUNING
-// ==========================================
-const float Kp_ToF_Terrain = 1.5;   // Increased from 0.5 to 1.5 for a larger lift response to obstacles
-
-// IMU Stabilization Gains
-const float Kp_IMU_Pitch = 1.0;
-const float Kp_IMU_Roll = 1.0;
-
-// CRITICAL FIX: Explicitly forced to 0.0. If these are 0.1, HX711 drift will cause the robot to roll randomly!
-const float Kp_Load_Extend = 0.0;   
-const float Kp_Load_Retract = 0.0;  
-
-const float TOF_DEADBAND = 1.0;   // Kept at 5mm to avoid hyper-sensitivity
-const float LOAD_DEADBAND = 15.0; // Ignore load variations less than 15 units
-const float MAX_LOCAL_OFFSET = 45.0; // Increased to 45.0 to allow the leg to lift higher over obstacles
-
-bool local_sensors_enabled = true; // Toggle for ToF/Load cell overrides
-bool plotter_mode = true;          // Toggle for Arduino Serial Plotter format
-
-// ==========================================
-// 3. SUCCESSIVE AVERAGE FILTERS (NOISE REDUCTION)
+// 0. SUCCESSIVE AVERAGE FILTER
 // ==========================================
 template <int N>
 struct SuccessiveAverage {
@@ -100,479 +33,529 @@ struct SuccessiveAverage {
     }
 
     float add(float val) {
-        // True Circular Buffer implementation (Rolling Average)
-        sum -= readings[index];  // Remove oldest reading from sum
-        readings[index] = val;   // Store new reading
-        sum += val;              // Add new reading to sum
-        index = (index + 1) % N; // Advance index cyclically
-        
+        sum -= readings[index];
+        readings[index] = val;
+        sum += val;
+        index = (index + 1) % N;
         if (count < N) count++;
         current_average = sum / count;
         return current_average;
     }
 };
 
-SuccessiveAverage<10> pitch_avg;
-SuccessiveAverage<10> roll_avg;
-SuccessiveAverage<1> tof_avg[4];  
-SuccessiveAverage<1> load_avg[4]; 
+// ==========================================
+// 1. PIN DEFINITIONS & CONSTANTS
+// ==========================================
+// Servo pins
+#define PIN_FL_SERVO 12
+#define PIN_FR_SERVO 42
+#define PIN_BL_SERVO 47
+#define PIN_BR_SERVO 21
+
+// Drive Motor Pins
+#define MOTOR_IN1 13
+#define MOTOR_IN2 14
+#define MOTOR_EN  11
+
+const int pwmFreq      = 5000;
+const int pwmResolution = 8;
+
+// I2C & Multiplexer Pins
+#define SDA_PIN  1
+#define SCL_PIN  2
+#define TCAADDR  0x70
 
 // ==========================================
-// 4. GLOBAL STATE VARIABLES
+// 2. GLOBAL OBJECTS & STATE
 // ==========================================
-Servo fl, fr, bl, br;
-Adafruit_MPU6050 mpu;
-HX711 scaleFL, scaleFR, scaleBL, scaleBR;
+Servo servoFL;
+Servo servoFR;
+Servo servoBL;
+Servo servoBR;
+
 Adafruit_VL53L0X tofFL = Adafruit_VL53L0X();
 Adafruit_VL53L0X tofFR = Adafruit_VL53L0X();
 Adafruit_VL53L0X tofBL = Adafruit_VL53L0X();
 Adafruit_VL53L0X tofBR = Adafruit_VL53L0X();
 
-bool mpu_ready = false;
-bool tof_ready[4] = {false, false, false, false}; // FL, FR, BL, BR
-bool motor_enabled = false; // Safety lockout state
+Adafruit_MPU6050 mpu;
 
-// Baselines calculated at startup
-float IMU_PITCH_OFFSET = 0.0, IMU_ROLL_OFFSET = 0.0;
-float BASE_TOF[4] = {0, 0, 0, 0}; 
-const int BASE_ANGLE_FRONT = 45;
-const int BASE_ANGLE_BACK = 55;
+bool tofFL_ready = false;
+bool tofFR_ready = false;
+bool tofBL_ready = false;
+bool tofBR_ready = false;
+bool mpu_ready   = false;
 
-// Current Sensor Data (Smoothed Output)
+// Motor persistent speed — reapplied every loop to prevent PWM dropout
+int currentMotorSpeed = 0;
+
+// Variables for Non-Blocking State Machine
+unsigned long lastToFPrintTime = 0;
+unsigned long mux_switch_time  = 0;
+uint8_t tof_read_state = 0;
+int distFL = -1, distFR = -1, distBL = -1, distBR = -1;
 float curr_pitch = 0.0, curr_roll = 0.0;
-float curr_tof[4] = {0, 0, 0, 0};
-float curr_load[4] = {0, 0, 0, 0};
 
-// Target Angles set by Serial Commands
-float target_pitch = 0.0;
-float target_roll = 0.0;
+// Baseline ToF Measurements
+int baseDistFL = 0;
+int baseDistFR = 0;
+int baseDistBL = 0;
+int baseDistBR = 0;
 
-// Current Mechanical State
-float currentFL = BASE_ANGLE_FRONT, currentFR = BASE_ANGLE_FRONT;
-float currentBL = BASE_ANGLE_BACK, currentBR = BASE_ANGLE_BACK;
+// ToF Rolling Averagers (Window of 5 readings)
+SuccessiveAverage<5> avgToF[4];
 
-// Timing Variables
-unsigned long lastControlTime = 0;
-unsigned long lastDiagTime = 0;
-uint8_t tof_poll_index = 0; // For round-robin ToF reading
-const unsigned long PLOT_INTERVAL = 50;   // 20Hz refresh rate for plotting
-const unsigned long DIAG_INTERVAL = 1000; // 1Hz refresh rate for text logging
+// Baseline IMU Measurements
+float basePitch      = 0.0;
+float baseRoll       = 0.0;
+float gyroBiasPitch  = 0.0;
+float gyroBiasRoll   = 0.0;
+
+// Complementary Filter Variables
+float comp_pitch     = 0.0;
+float comp_roll      = 0.0;
+unsigned long last_imu_time = 0;
+
+// Targeted Active Suspension Configuration
+float TOF_DEADBAND = 2.0;   // mm deadband to detect terrain anomaly
+float IMU_DEADBAND = 0.5;   // Degrees of tilt to trigger leveling
+float MAX_OFFSET   = 45.0;  // Maximum servo correction (degrees)
+int   baseHeight   = 45;    // Central ride height (degrees)
+bool  auto_level   = true;  // Toggle targeted leveling feature
+
+// Incremental PID Gains (tune these)
+// Kp: proportional — how hard to push per degree of tilt
+// Ki: integral     — removes steady-state error over time
+// Kd: derivative   — damps oscillation by resisting rapid change
+float PID_KP = 5.5;
+float PID_KI = 0.05;
+float PID_KD = 0.8;
+
+// Per-leg incremental PID state
+// Each leg tracks its own accumulated output and previous errors
+// so corrections are independent and don't fight each other
+struct LegPID {
+    float output;       // Accumulated servo offset (degrees)
+    float prev_err;     // Error from last cycle (for D term)
+    float integral;     // Accumulated error (for I term, with clamping)
+    bool  responsible;  // Is this leg currently on uneven terrain?
+
+    LegPID() : output(0), prev_err(0), integral(0), responsible(false) {}
+
+    // Incremental PID: computes delta output each cycle.
+    // sign_p / sign_r: +1 or -1 — which direction pitch/roll error
+    //                  should drive this leg
+    float update(float pitch_err, float roll_err, float dt,
+                 float sign_p, float sign_r,
+                 float kp, float ki, float kd, float max_out) {
+
+        if (!responsible) {
+            // Smoothly decay offset back to zero when on flat ground
+            output   *= 0.92f;
+            integral *= 0.92f;
+            prev_err  = 0;
+            return output;
+        }
+
+        // Combined error for this leg from both pitch and roll axes
+        float err = (sign_p * pitch_err) + (sign_r * roll_err);
+
+        // Incremental (velocity-form) PID:
+        // delta = Kp*(e - e_prev) + Ki*e*dt + Kd*(e - 2*e_prev + e_pprev)/dt
+        // Simplified here as standard positional PID on the combined error,
+        // but applied as an increment to avoid step changes on gain tuning.
+        integral += err * dt;
+        integral  = constrain(integral, -max_out / ki, max_out / ki); // Anti-windup
+
+        float derivative = (err - prev_err) / dt;
+        float delta      = kp * err + ki * integral + kd * derivative;
+
+        output   += delta * dt;  // Incremental: add delta scaled by dt
+        output    = constrain(output, -max_out, max_out);
+        prev_err  = err;
+
+        return output;
+    }
+
+    void reset() {
+        output = 0; prev_err = 0; integral = 0; responsible = false;
+    }
+};
+
+LegPID pidFL, pidFR, pidBL, pidBR;
+
+// Convenience accessors for plotter / serial output
+#define offsetFL pidFL.output
+#define offsetFR pidFR.output
+#define offsetBL pidBL.output
+#define offsetBR pidBR.output
+#define respFL   pidFL.responsible
+#define respFR   pidFR.responsible
+#define respBL   pidBL.responsible
+#define respBR   pidBR.responsible
 
 // ==========================================
-// 5. HARDWARE HELPERS
+// 3. HARDWARE HELPERS
 // ==========================================
 void tcaSelect(uint8_t i) {
     if (i > 7) return;
     Wire.beginTransmission(TCAADDR);
     Wire.write(1 << i);
-    Wire.endTransmission(true); 
-    delay(5); 
+    Wire.endTransmission(true);
 }
 
-float stepTowards(float current, float target, float max_step) {
-    if (abs(target - current) <= max_step) return target;
-    if (target > current) return current + max_step;
-    return current - max_step;
-}
-
-// ==========================================
-// 6. NON-BLOCKING SENSOR ACQUISITION
-// ==========================================
-void updateIMU() {
-    if (!mpu_ready) return;
-    tcaSelect(4);
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    
-    // Custom inverted roll feedback applied
-    float raw_roll  = (-atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI);
-    float raw_pitch = (atan2(a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI);
-    
-    curr_pitch = pitch_avg.add(raw_pitch - IMU_PITCH_OFFSET);
-    curr_roll  = roll_avg.add(raw_roll - IMU_ROLL_OFFSET);
-}
-
-void updateToFRoundRobin() {
-    VL53L0X_RangingMeasurementData_t measure;
-    
-    switch(tof_poll_index) {
-        case 0:
-            if (tof_ready[0]) {
-                tcaSelect(0);
-                tofFL.rangingTest(&measure, false);
-                if (measure.RangeStatus != 4 && measure.RangeMilliMeter < 2000) {
-                    curr_tof[0] = tof_avg[0].add(measure.RangeMilliMeter);
-                }
-            }
-            break;
-        case 1:
-            if (tof_ready[1]) {
-                tcaSelect(3);
-                tofFR.rangingTest(&measure, false);
-                if (measure.RangeStatus != 4 && measure.RangeMilliMeter < 2000) {
-                    curr_tof[1] = tof_avg[1].add(measure.RangeMilliMeter);
-                }
-            }
-            break;
-        case 2:
-            if (tof_ready[2]) {
-                tcaSelect(1); 
-                tofBL.rangingTest(&measure, false);
-                if (measure.RangeStatus != 4 && measure.RangeMilliMeter < 2000) {
-                    curr_tof[2] = tof_avg[2].add(measure.RangeMilliMeter);
-                }
-            }
-            break;
-        case 3:
-            if (tof_ready[3]) {
-                tcaSelect(2); 
-                tofBR.rangingTest(&measure, false);
-                if (measure.RangeStatus != 4 && measure.RangeMilliMeter < 2000) {
-                    curr_tof[3] = tof_avg[3].add(measure.RangeMilliMeter);
-                }
-            }
-            break;
+bool pingI2C(uint8_t addr) {
+    for (int i = 0; i < 3; i++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) return true;
+        delay(5);
     }
-    
-    tof_poll_index++;
-    if (tof_poll_index > 3) tof_poll_index = 0;
+    return false;
 }
 
-void updateLoadCells() {
-    if(scaleFL.is_ready()) curr_load[0] = load_avg[0].add(scaleFL.get_units(1));
-    if(scaleFR.is_ready()) curr_load[1] = load_avg[1].add(scaleFR.get_units(1));
-    if(scaleBL.is_ready()) curr_load[2] = load_avg[2].add(scaleBL.get_units(1));
-    if(scaleBR.is_ready()) curr_load[3] = load_avg[3].add(scaleBR.get_units(1));
-}
+// ---- Motor ----
+void setMotorSpeed(int speed) {
+    currentMotorSpeed = constrain(speed, 0, 255);
+    ledcWrite(MOTOR_EN, currentMotorSpeed);
 
-// ==========================================
-// 6.5 DRIVE MOTOR SPEED CONTROL
-// ==========================================
-void updateMotorSpeed() {
-    if (!motor_enabled) return; // Prevent actuation if safety lockout is active
-
-    bool sel0 = digitalRead(PIN_SPEED_SEL_0);
-    bool sel1 = digitalRead(PIN_SPEED_SEL_1);
-    
-    int pwm_val = 0;
-
-    if (!sel0 && !sel1) {
-        pwm_val = 0;      // 0%
-    } else if (sel0 && !sel1) {
-        pwm_val = 64;     // 25% (255 * 0.25 = 63.75)
-    } else if (!sel0 && sel1) {
-        pwm_val = 127;    // 50% (255 * 0.50 = 127.5)
-    } else if (sel0 && sel1) {
-        pwm_val = 191;    // 75% (255 * 0.75 = 191.25)
+    // Auto-leveling follows motor state
+    if (currentMotorSpeed > 0) {
+        auto_level = true;
+        Serial.printf("DRIVE MOTOR -> %d | Auto-Leveling ENABLED\n", currentMotorSpeed);
+    } else {
+        auto_level = false;
+        Serial.printf("DRIVE MOTOR -> 0 | Auto-Leveling DISABLED\n");
     }
+}
 
-    ledcWrite(MOTOR_EN, pwm_val);
+// ---- Servos ----
+void setHeight(int h) {
+    baseHeight = constrain(h, 0, 180);
+
+    // Reset offsets when manually changing height
+    offsetFL = 0; offsetFR = 0; offsetBL = 0; offsetBR = 0;
+
+    servoFL.write(baseHeight);
+    servoFR.write(180 - baseHeight);
+    servoBL.write(180 - baseHeight);
+    servoBR.write(baseHeight);
+
+    Serial.printf("BASE HEIGHT SET TO %d -> FL:%d FR:%d BL:%d BR:%d\n",
+                  baseHeight, baseHeight, 180 - baseHeight, 180 - baseHeight, baseHeight);
+}
+
+void setSingleServo(String cmd) {
+    int angle = cmd.substring(2).toInt();
+    angle = constrain(angle, 0, 180);
+    String id = cmd.substring(0, 2);
+
+    if      (id == "FL") { servoFL.write(angle);         Serial.printf("FL -> %d\n", angle); }
+    else if (id == "FR") { servoFR.write(angle);         Serial.printf("FR -> %d\n", angle); }
+    else if (id == "BL") { servoBL.write(angle);         Serial.printf("BL -> %d\n", angle); }
+    else if (id == "BR") { servoBR.write(angle);         Serial.printf("BR -> %d\n", angle); }
+    else                 { Serial.println("Invalid servo command"); }
 }
 
 // ==========================================
-// 7. CLOSED-LOOP KINEMATICS ENGINE
-// ==========================================
-void processKinematics() {
-    // 1. Calculate Feed-Forward User Commands
-    float cmd_pitch = (target_pitch >= 0) ? (target_pitch * GEOMETRY_PITCH_MULT_POS) : (target_pitch * GEOMETRY_PITCH_MULT_NEG);
-    float cmd_roll  = (target_roll >= 0)  ? (target_roll * GEOMETRY_ROLL_MULT_POS)   : (target_roll * GEOMETRY_ROLL_MULT_NEG);
-
-    // 2. Calculate Closed-Loop Auto-Leveling
-    // FIX: (current - target) to provide negative feedback and prevent positive loop bucking
-    float imu_pitch = (curr_pitch - target_pitch) * Kp_IMU_Pitch;
-    float imu_roll  = (curr_roll - target_roll) * Kp_IMU_Roll;
-
-    // Combine adjustments
-    float total_pitch = cmd_pitch + imu_pitch;
-    float total_roll  = cmd_roll + imu_roll;
-
-    // 3. Calculate Targets for each leg
-    float targetFL = BASE_ANGLE_FRONT - total_pitch - total_roll;
-    float targetFR = BASE_ANGLE_FRONT - total_pitch + total_roll;
-    float targetBL = BASE_ANGLE_BACK  + total_pitch - total_roll;
-    float targetBR = BASE_ANGLE_BACK  + total_pitch + total_roll;
-
-    // 4. Independent Local Suspension (ToF Proactive + Load Cell Reactive)
-    if (local_sensors_enabled) {
-        for (int i = 0; i < 4; i++) {
-            float tof_offset = 0;
-            float load_offset = 0;
-
-            // Proactive Terrain Mapping (ToF)
-            float tof_diff = BASE_TOF[i] - curr_tof[i];
-            if (tof_diff > TOF_DEADBAND) { 
-                tof_offset = (tof_diff - TOF_DEADBAND) * Kp_ToF_Terrain;
-            } else if (tof_diff < -TOF_DEADBAND) {
-                tof_offset = (tof_diff + TOF_DEADBAND) * Kp_ToF_Terrain;
-            }
-
-            // Reactive Shock Absorption (Load Cells)
-            if (curr_load[i] < -LOAD_DEADBAND) { 
-                load_offset = -abs(curr_load[i] + LOAD_DEADBAND) * Kp_Load_Extend;
-            } else if (curr_load[i] > LOAD_DEADBAND) { 
-                load_offset = abs(curr_load[i] - LOAD_DEADBAND) * Kp_Load_Retract;
-            }
-
-            float local_offset = constrain(tof_offset + load_offset, -MAX_LOCAL_OFFSET, MAX_LOCAL_OFFSET);
-
-            if (i == 0) targetFL += local_offset;
-            if (i == 1) targetFR += local_offset;
-            if (i == 2) targetBL += local_offset;
-            if (i == 3) targetBR += local_offset;
-        }
-    }
-
-    // 4. Constrain absolute physical limits to prevent self-destruction
-    targetFL = constrain(targetFL, 10, 80);
-    targetFR = constrain(targetFR, 10, 80);
-    targetBL = constrain(targetBL, 20, 90);
-    targetBR = constrain(targetBR, 20, 90);
-
-    // 5. Apply Slew Rate Limit (Smooth, non-blocking transition)
-    currentFL = stepTowards(currentFL, targetFL, MAX_ANGLE_STEP);
-    currentFR = stepTowards(currentFR, targetFR, MAX_ANGLE_STEP);
-    currentBL = stepTowards(currentBL, targetBL, MAX_ANGLE_STEP);
-    currentBR = stepTowards(currentBR, targetBR, MAX_ANGLE_STEP);
-
-    // 6. Write to Hardware
-    fl.write(180 - currentFL);
-    fr.write(currentFR);
-    bl.write(currentBL);
-    br.write(180 - currentBR);
-}
-
-// ==========================================
-// 8. SETUP & CALIBRATION
+// 4. SETUP
 // ==========================================
 void setup() {
     Serial.begin(115200);
-    Wire.begin(SDA_PIN, SCL_PIN); 
-    Wire.setClock(100000); 
-    delay(1000);
-    
-    Serial.println("System Booting... Independent Active Suspension");
 
-    // --- Switch Inputs Initialization ---
-    pinMode(PIN_SPEED_SEL_0, INPUT_PULLDOWN);
-    pinMode(PIN_SPEED_SEL_1, INPUT_PULLDOWN);
+    // Start I2C
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(100000);
 
-    // --- Servos Initialization ---
+    // ---- Servos first (they claim timers 0-3) ----
     ESP32PWM::allocateTimer(0);
     ESP32PWM::allocateTimer(1);
     ESP32PWM::allocateTimer(2);
-    
-    fl.setPeriodHertz(50); fr.setPeriodHertz(50); bl.setPeriodHertz(50); br.setPeriodHertz(50);
-    
-    Serial.println("Moving actuators to HOME position before IMU calibration...");
-    
-    fl.attach(PIN_FL_SERVO); fl.write(180 - BASE_ANGLE_FRONT); delay(250); 
-    fr.attach(PIN_FR_SERVO); fr.write(BASE_ANGLE_FRONT);       delay(250);
-    bl.attach(PIN_BL_SERVO); bl.write(BASE_ANGLE_BACK);        delay(250);
-    br.attach(PIN_BR_SERVO); br.write(180 - BASE_ANGLE_BACK);
-    delay(1250); 
+    ESP32PWM::allocateTimer(3);
 
-    // --- Drive Motor (L298N) Initialization ---
-    Serial.println("Initializing Drive Motor (Kept STOPPED during setup)...");
+    servoFL.attach(PIN_FL_SERVO, 500, 2400);
+    servoFR.attach(PIN_FR_SERVO, 500, 2400);
+    servoBL.attach(PIN_BL_SERVO, 500, 2400);
+    servoBR.attach(PIN_BR_SERVO, 500, 2400);
+
+    // ---- Motor AFTER servos so LEDC channel allocation doesn't conflict ----
     pinMode(MOTOR_IN1, OUTPUT);
     pinMode(MOTOR_IN2, OUTPUT);
-    
-    digitalWrite(MOTOR_IN1, LOW);
-    digitalWrite(MOTOR_IN2, LOW);
-    
-    ledcAttach(MOTOR_EN, pwmFreq, pwmResolution);
-    ledcWrite(MOTOR_EN, 0); 
+    digitalWrite(MOTOR_IN1, LOW);  // Reversed direction
+    digitalWrite(MOTOR_IN2, HIGH);
 
-    // --- IMU ---
-    tcaSelect(4);
-    if (mpu.begin()) {
-        mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    ledcAttach(MOTOR_EN, pwmFreq, pwmResolution);
+    ledcWrite(MOTOR_EN, 0); // Start stopped
+
+    // ---- ToF Sensors ----
+    Serial.println("Initializing ToF sensors...");
+
+    tcaSelect(0); delay(10);
+    if (pingI2C(0x29) && tofFL.begin()) { tofFL_ready = true; Serial.println("ToF FL: OK"); }
+    else { Serial.println("ToF FL: FAILED"); }
+
+    tcaSelect(3); delay(10);
+    if (pingI2C(0x29) && tofFR.begin()) { tofFR_ready = true; Serial.println("ToF FR: OK"); }
+    else { Serial.println("ToF FR: FAILED"); }
+
+    tcaSelect(1); delay(10);
+    if (pingI2C(0x29) && tofBL.begin()) { tofBL_ready = true; Serial.println("ToF BL: OK"); }
+    else { Serial.println("ToF BL: FAILED"); }
+
+    tcaSelect(2); delay(10);
+    if (pingI2C(0x29) && tofBR.begin()) { tofBR_ready = true; Serial.println("ToF BR: OK"); }
+    else { Serial.println("ToF BR: FAILED"); }
+
+    // ---- IMU ----
+    Serial.println("Initializing IMU...");
+    tcaSelect(4); delay(10);
+    if (pingI2C(0x68) && mpu.begin()) {
         mpu_ready = true;
-        Serial.println("Calibrating IMU Baseline... Keep platform completely flat!");
-        float p_sum = 0, r_sum = 0;
-        for(int i=0; i<100; i++) {
+        mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+        Serial.println("IMU: OK");
+    } else {
+        Serial.println("IMU: FAILED");
+    }
+
+    // Home position
+    setHeight(baseHeight);
+    Serial.println("Waiting 1.5s for servos to reach home position...");
+    delay(1500);
+
+    // ---- Calibrate ToF Baselines ----
+    Serial.println("Calibrating ToF baselines (averaging 10 readings)...");
+    long sumFL = 0, sumFR = 0, sumBL = 0, sumBR = 0;
+    int  cntFL = 0, cntFR = 0, cntBL = 0, cntBR = 0;
+
+    for (int i = 0; i < 10; i++) {
+        VL53L0X_RangingMeasurementData_t measure;
+        if (tofFL_ready) { tcaSelect(0); delay(5); tofFL.rangingTest(&measure, false); if (measure.RangeStatus != 4) { sumFL += measure.RangeMilliMeter; cntFL++; } }
+        if (tofFR_ready) { tcaSelect(3); delay(5); tofFR.rangingTest(&measure, false); if (measure.RangeStatus != 4) { sumFR += measure.RangeMilliMeter; cntFR++; } }
+        if (tofBL_ready) { tcaSelect(1); delay(5); tofBL.rangingTest(&measure, false); if (measure.RangeStatus != 4) { sumBL += measure.RangeMilliMeter; cntBL++; } }
+        if (tofBR_ready) { tcaSelect(2); delay(5); tofBR.rangingTest(&measure, false); if (measure.RangeStatus != 4) { sumBR += measure.RangeMilliMeter; cntBR++; } }
+    }
+
+    if (cntFL > 0) { baseDistFL = sumFL / cntFL; avgToF[0].init(baseDistFL); }
+    if (cntFR > 0) { baseDistFR = sumFR / cntFR; avgToF[1].init(baseDistFR); }
+    if (cntBL > 0) { baseDistBL = sumBL / cntBL; avgToF[2].init(baseDistBL); }
+    if (cntBR > 0) { baseDistBR = sumBR / cntBR; avgToF[3].init(baseDistBR); }
+
+    Serial.printf("Baselines (mm) -> FL:%d | FR:%d | BL:%d | BR:%d\n",
+                  baseDistFL, baseDistFR, baseDistBL, baseDistBR);
+
+    // ---- Calibrate IMU Baselines ----
+    Serial.println("Calibrating IMU baselines & gyro bias (averaging 50 readings)...");
+    if (mpu_ready) {
+        tcaSelect(4); delay(5);
+        float p_sum = 0, r_sum = 0, gp_sum = 0, gr_sum = 0;
+
+        for (int i = 0; i < 50; i++) {
             sensors_event_t a, g, temp;
             mpu.getEvent(&a, &g, &temp);
-            r_sum += (-atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI);
-            p_sum += (atan2(a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI);
-            delay(5);
+            r_sum  += (-atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI);
+            p_sum  += (atan2(a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI);
+            gp_sum += (g.gyro.y * 180.0 / PI);
+            gr_sum += (-g.gyro.x * 180.0 / PI);
+            delay(10);
         }
-        IMU_PITCH_OFFSET = p_sum / 100.0;
-        IMU_ROLL_OFFSET = r_sum / 100.0;
-        
-        pitch_avg.init(0.0);
-        roll_avg.init(0.0);
-    } else {
-        Serial.println("IMU: FAILED TO INITIALIZE");
+
+        basePitch     = p_sum  / 50.0;
+        baseRoll      = r_sum  / 50.0;
+        gyroBiasPitch = gp_sum / 50.0;
+        gyroBiasRoll  = gr_sum / 50.0;
+
+        comp_pitch    = basePitch;
+        comp_roll     = baseRoll;
+        last_imu_time = millis();
+
+        Serial.printf("IMU Baselines -> P:%.1f | R:%.1f\n", basePitch, baseRoll);
+        Serial.printf("Gyro Bias -> P_Rate:%.2f | R_Rate:%.2f\n", gyroBiasPitch, gyroBiasRoll);
     }
 
-    // --- ToF Sensors ---
-    Serial.println("Initializing ToF Sensors (HIGH SPEED MODE)...");
-    tcaSelect(0); 
-    if (tofFL.begin()) { tofFL.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); tof_ready[0] = true; Serial.println("ToF FL: OK"); } else { Serial.println("ToF FL: FAILED"); }
-    tcaSelect(3); 
-    if (tofFR.begin()) { tofFR.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); tof_ready[1] = true; Serial.println("ToF FR: OK"); } else { Serial.println("ToF FR: FAILED"); }
-    tcaSelect(1); 
-    if (tofBL.begin()) { tofBL.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); tof_ready[2] = true; Serial.println("ToF BL: OK"); } else { Serial.println("ToF BL: FAILED"); }
-    tcaSelect(2); 
-    if (tofBR.begin()) { tofBR.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_HIGH_SPEED); tof_ready[3] = true; Serial.println("ToF BR: OK"); } else { Serial.println("ToF BR: FAILED"); }
-    
-    Serial.println("Calibrating ToF Baselines...");
-    VL53L0X_RangingMeasurementData_t measure;
-    for(int i=0; i<4; i++) {
-        if(!tof_ready[i]) continue;
-        uint8_t ch = (i==0)?0:(i==1)?3:(i==2)?1:2; 
-        tcaSelect(ch);
-        
-        long sum = 0; int valid = 0;
-        for(int j=0; j<20; j++) {
-            if(i==0) tofFL.rangingTest(&measure, false);
-            else if(i==1) tofFR.rangingTest(&measure, false);
-            else if(i==2) tofBL.rangingTest(&measure, false);
-            else if(i==3) tofBR.rangingTest(&measure, false);
-            
-            if(measure.RangeStatus != 4 && measure.RangeMilliMeter < 2000) { 
-                sum += measure.RangeMilliMeter; valid++; 
-            }
-        }
-        BASE_TOF[i] = (valid > 0) ? (sum / valid) : 100; 
-        tof_avg[i].init(BASE_TOF[i]);
-        curr_tof[i] = BASE_TOF[i];
-    }
-
-    // --- Load Cells ---
-    Serial.println("Taring Load Cells...");
-    scaleFL.begin(FL_DT, FL_SCK); scaleFR.begin(FR_DT, FR_SCK);
-    scaleBL.begin(BL_DT, BL_SCK); scaleBR.begin(BR_DT, BR_SCK);
-    
-    scaleFL.set_scale(1000.0); scaleFR.set_scale(-1000.0);
-    scaleBL.set_scale(-1000.0); scaleBR.set_scale(1000.0);
-    
-    delay(500); 
-
-    bool lc_ready = true;
-    if(scaleFL.is_ready()) { scaleFL.tare(20); } else { lc_ready = false; Serial.println("Load FL: FAILED"); }
-    if(scaleFR.is_ready()) { scaleFR.tare(20); } else { lc_ready = false; Serial.println("Load FR: FAILED"); }
-    if(scaleBL.is_ready()) { scaleBL.tare(20); } else { lc_ready = false; Serial.println("Load BL: FAILED"); }
-    if(scaleBR.is_ready()) { scaleBR.tare(20); } else { lc_ready = false; Serial.println("Load BR: FAILED"); }
-    
-    for(int i=0; i<4; i++) {
-        load_avg[i].init(0.0);
-        curr_load[i] = 0.0;
-    }
-
-    // --- INTEGRITY CHECK & MOTOR START ---
-    Serial.println("--- SYSTEM INTEGRITY CHECK ---");
-    bool all_tofs_intact = tof_ready[0] && tof_ready[1] && tof_ready[2] && tof_ready[3];
-    
-    bool FORCE_MOTOR_RUN = true; 
-    
-    if ((mpu_ready && all_tofs_intact && lc_ready) || FORCE_MOTOR_RUN) {
-        Serial.println("STATUS: INTACT (Or Forced) - Starting Drive Motor Logic...");
-        
-        digitalWrite(MOTOR_IN1, HIGH);
-        digitalWrite(MOTOR_IN2, LOW);
-        motor_enabled = true; // Clear the lockout
-        updateMotorSpeed();   // Set initial speed based on switches
-    } else {
-        Serial.println("STATUS: DEGRADED - One or more sensors failed to initialize.");
-        Serial.println("SAFETY LOCKOUT: Drive Motor will remain STOPPED. (Set FORCE_MOTOR_RUN=true to bypass)");
-        digitalWrite(MOTOR_IN1, LOW); 
-        digitalWrite(MOTOR_IN2, LOW); 
-        ledcWrite(MOTOR_EN, 0); 
-        motor_enabled = false; // Engage lockout
-    }
-
-    Serial.println("--- SYSTEM ONLINE ---");
-    Serial.println("Commands: 'PITCH <deg>', 'ROLL <deg>', 'HOME', 'LOCAL OFF', 'LOCAL ON', 'PLOT ON', 'PLOT OFF'");
+    Serial.println("\nREADY");
+    Serial.println("Commands:");
+    Serial.println("  H0-H180       : height control");
+    Serial.println("  FL90 FR90 ... : individual servo");
+    Serial.println("  M0-M255       : motor speed");
+    Serial.println("  AUTO ON/OFF   : toggle active leveling");
+    Serial.println("-------------------------------------------");
 }
 
 // ==========================================
-// 9. MAIN FAST LOOP
+// 5. MAIN LOOP
 // ==========================================
 void loop() {
-    unsigned long currentMillis = millis();
+    unsigned long current_time = millis();
 
-    // 1. Handle Serial Commands
-    if (Serial.available() > 0) {
-        String input = Serial.readStringUntil('\n');
-        input.trim();
-        String upperInput = input;
-        upperInput.toUpperCase();
-        
-        if (upperInput == "HOME") { 
-            target_pitch = 0.0;
-            target_roll = 0.0;
-            if(!plotter_mode) Serial.println("OK: HOME (Target Pitch=0, Target Roll=0)"); 
-        }
-        else if (upperInput.startsWith("PITCH ")) {
-            target_pitch = input.substring(6).toFloat();
-            if(!plotter_mode) { Serial.print("OK: Commanded Geometric Pitch = "); Serial.println(target_pitch); }
-        }
-        else if (upperInput.startsWith("ROLL ")) {
-            target_roll = input.substring(5).toFloat();
-            if(!plotter_mode) { Serial.print("OK: Commanded Geometric Roll = "); Serial.println(target_roll); }
-        }
-        else if (upperInput == "LOCAL OFF") {
-            local_sensors_enabled = false;
-            if(!plotter_mode) Serial.println("OK: ToF & Load Cell Overrides DISABLED");
-        }
-        else if (upperInput == "LOCAL ON") {
-            local_sensors_enabled = true;
-            if(!plotter_mode) Serial.println("OK: ToF & Load Cell Overrides ENABLED");
-        }
-        else if (upperInput == "PLOT ON") {
-            plotter_mode = true;
-        }
-        else if (upperInput == "PLOT OFF") {
-            plotter_mode = false;
-            Serial.println("OK: Plotter Mode DISABLED");
+    // --- 1. Serial Commands ---
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+        cmd.toUpperCase();
+
+        if      (cmd == "AUTO ON")        { auto_level = true;  Serial.println("Targeted Leveling ENABLED"); }
+        else if (cmd == "AUTO OFF")       { auto_level = false; Serial.println("Targeted Leveling DISABLED"); }
+        else if (cmd.startsWith("M"))     { setMotorSpeed(cmd.substring(1).toInt()); }
+        else if (cmd.startsWith("H"))     { setHeight(cmd.substring(1).toInt()); }
+        else if (cmd.length() >= 3)       { setSingleServo(cmd); }
+    }
+
+    // --- 2. Fast IMU Polling (50 Hz) ---
+    if (tof_read_state == 0 && (current_time - last_imu_time >= 20)) {
+        float dt = (current_time - last_imu_time) / 1000.0;
+        last_imu_time = current_time;
+
+        if (mpu_ready) {
+            tcaSelect(4);
+            delayMicroseconds(500);
+
+            sensors_event_t a, g, temp;
+            mpu.getEvent(&a, &g, &temp);
+
+            float acc_roll       = (-atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI);
+            float acc_pitch      = (atan2(a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI);
+            float gyro_pitch_rate = (g.gyro.y * 180.0 / PI) - gyroBiasPitch;
+            float gyro_roll_rate  = (-g.gyro.x * 180.0 / PI) - gyroBiasRoll;
+
+            const float alpha = 0.96;
+            comp_pitch = alpha * (comp_pitch + gyro_pitch_rate * dt) + (1.0 - alpha) * acc_pitch;
+            comp_roll  = alpha * (comp_roll  + gyro_roll_rate  * dt) + (1.0 - alpha) * acc_roll;
+
+            curr_pitch = comp_pitch;
+            curr_roll  = comp_roll;
+
+            if (auto_level) {
+                float pitch_err = curr_pitch - basePitch;
+                float roll_err  = curr_roll  - baseRoll;
+
+                // Incremental PID per leg.
+                // Sign convention: (+pitch, -roll) means front-left corner is high.
+                // Each leg's sign pair determines how pitch/roll error drives it:
+                //   FL: +pitch raises front → push FL down (+p), roll left lowers FL → push FL up (-r)
+                //   FR: +pitch raises front → push FR down (+p), roll right raises FR → push FR down (+r)
+                //   BL: +pitch lowers rear  → push BL up  (-p), roll left  raises BL  → push BL up  (+r) -- wait, inverted: (-p,-r)
+                //   BR: +pitch lowers rear  → push BR up  (-p), roll right lowers BR  → push BR down(-r) -- (+r) for BR
+                // Simplified: FL(+p,-r)  FR(+p,+r)  BL(-p,-r)  BR(-p,+r)
+                pidFL.update(pitch_err, roll_err, dt, +1, -1, PID_KP, PID_KI, PID_KD, MAX_OFFSET);
+                pidFR.update(pitch_err, roll_err, dt, +1, +1, PID_KP, PID_KI, PID_KD, MAX_OFFSET);
+                pidBL.update(pitch_err, roll_err, dt, -1, -1, PID_KP, PID_KI, PID_KD, MAX_OFFSET);
+                pidBR.update(pitch_err, roll_err, dt, -1, +1, PID_KP, PID_KI, PID_KD, MAX_OFFSET);
+
+                // Apply to servos
+                servoFL.write(constrain((int)(baseHeight + pidFL.output), 0, 180));
+                servoFR.write(constrain(180 - (int)(baseHeight + pidFR.output), 0, 180));
+                servoBL.write(constrain(180 - (int)(baseHeight + pidBL.output), 0, 180));
+                servoBR.write(constrain((int)(baseHeight + pidBR.output), 0, 180));
+            }
         }
     }
 
-    // 2. Update Sensors
-    updateIMU();
-    updateToFRoundRobin();
-    updateLoadCells();
-    updateMotorSpeed(); // Continuously poll switches for dynamic speed adjustment
-
-    // 3. Process Kinematics (~66Hz loop)
-    if (currentMillis - lastControlTime >= 15) {
-        lastControlTime = currentMillis;
-        processKinematics();
-    }
-
-    // 4. Debug Diagnostics
-    unsigned long diag_interval = plotter_mode ? PLOT_INTERVAL : DIAG_INTERVAL;
-    if (currentMillis - lastDiagTime >= diag_interval) {
-        lastDiagTime = currentMillis;
-
-        if (plotter_mode) {
-            float norm_tof_FL = BASE_TOF[0] - curr_tof[0];
-            float norm_tof_FR = BASE_TOF[1] - curr_tof[1];
-            float norm_tof_BL = BASE_TOF[2] - curr_tof[2];
-            float norm_tof_BR = BASE_TOF[3] - curr_tof[3];
-
-            Serial.print("IMU_Pitch:"); Serial.print(curr_pitch, 2); Serial.print(",");
-            Serial.print("IMU_Roll:"); Serial.print(curr_roll, 2); Serial.print(",");
-            Serial.print("ToF_FL:"); Serial.print(norm_tof_FL, 2); Serial.print(",");
-            Serial.print("ToF_FR:"); Serial.print(norm_tof_FR, 2); Serial.print(",");
-            Serial.print("ToF_BL:"); Serial.print(norm_tof_BL, 2); Serial.print(",");
-            Serial.print("ToF_BR:"); Serial.print(norm_tof_BR, 2); Serial.print(",");
-            Serial.print("Load_FL:"); Serial.print(curr_load[0], 2); Serial.print(",");
-            Serial.print("Load_FR:"); Serial.print(curr_load[1], 2); Serial.print(",");
-            Serial.print("Load_BL:"); Serial.print(curr_load[2], 2); Serial.print(",");
-            Serial.print("Load_BR:"); Serial.println(curr_load[3], 2);
-        } else {
-            Serial.print("Target [P: "); Serial.print(target_pitch, 1);
-            Serial.print(" | R: "); Serial.print(target_roll, 1);
-            Serial.print("]   ||   Actual IMU [P: "); Serial.print(curr_pitch, 1);
-            Serial.print(" | R: "); Serial.print(curr_roll, 1);
-            Serial.print("]   ||   ToF(FL,FR,BL,BR): ["); 
-            Serial.print(curr_tof[0], 0); Serial.print(","); Serial.print(curr_tof[1], 0); Serial.print(",");
-            Serial.print(curr_tof[2], 0); Serial.print(","); Serial.print(curr_tof[3], 0);
-            Serial.print("]   ||   Load(FL,FR,BL,BR): ["); 
-            Serial.print(curr_load[0], 1); Serial.print(","); Serial.print(curr_load[1], 1); Serial.print(",");
-            Serial.print(curr_load[2], 1); Serial.print(","); Serial.print(curr_load[3], 1); Serial.println("]");
+    // --- 3. Non-Blocking ToF Polling (every 500 ms) ---
+    if (tof_read_state == 0) {
+        if (current_time - lastToFPrintTime > 500) {
+            lastToFPrintTime = current_time;
+            tcaSelect(0);
+            mux_switch_time = current_time;
+            tof_read_state  = 1;
         }
     }
+    else if (tof_read_state == 1) {
+        if (current_time - mux_switch_time >= 5) {
+            if (tofFL_ready) {
+                VL53L0X_RangingMeasurementData_t measure;
+                tofFL.rangingTest(&measure, false);
+                distFL = (measure.RangeStatus != 4) ? (int)avgToF[0].add(measure.RangeMilliMeter) : -1;
+            }
+            tcaSelect(3);
+            mux_switch_time = millis();
+            tof_read_state  = 2;
+        }
+    }
+    else if (tof_read_state == 2) {
+        if (current_time - mux_switch_time >= 5) {
+            if (tofFR_ready) {
+                VL53L0X_RangingMeasurementData_t measure;
+                tofFR.rangingTest(&measure, false);
+                distFR = (measure.RangeStatus != 4) ? (int)avgToF[1].add(measure.RangeMilliMeter) : -1;
+            }
+            tcaSelect(1);
+            mux_switch_time = millis();
+            tof_read_state  = 3;
+        }
+    }
+    else if (tof_read_state == 3) {
+        if (current_time - mux_switch_time >= 5) {
+            if (tofBL_ready) {
+                VL53L0X_RangingMeasurementData_t measure;
+                tofBL.rangingTest(&measure, false);
+                distBL = (measure.RangeStatus != 4) ? (int)avgToF[2].add(measure.RangeMilliMeter) : -1;
+            }
+            tcaSelect(2);
+            mux_switch_time = millis();
+            tof_read_state  = 4;
+        }
+    }
+    else if (tof_read_state == 4) {
+        if (current_time - mux_switch_time >= 5) {
+            if (tofBR_ready) {
+                VL53L0X_RangingMeasurementData_t measure;
+                tofBR.rangingTest(&measure, false);
+                distBR = (measure.RangeStatus != 4) ? (int)avgToF[3].add(measure.RangeMilliMeter) : -1;
+            }
+
+            float pitch_err = curr_pitch - basePitch;
+            float roll_err  = curr_roll  - baseRoll;
+
+            int normFL = (distFL != -1) ? (distFL - baseDistFL) : 0;
+            int normFR = (distFR != -1) ? (distFR - baseDistFR) : 0;
+            int normBL = (distBL != -1) ? (distBL - baseDistBL) : 0;
+            int normBR = (distBR != -1) ? (distBR - baseDistBR) : 0;
+
+            // Tag responsible legs based on tilt + ToF confirmation
+            if (pitch_err > IMU_DEADBAND) {
+                if (normFL >  TOF_DEADBAND) respFL = true;
+                if (normFR >  TOF_DEADBAND) respFR = true;
+                if (normBL < -TOF_DEADBAND) respBL = true;
+                if (normBR < -TOF_DEADBAND) respBR = true;
+            }
+            if (pitch_err < -IMU_DEADBAND) {
+                if (normFL < -TOF_DEADBAND) respFL = true;
+                if (normFR < -TOF_DEADBAND) respFR = true;
+                if (normBL >  TOF_DEADBAND) respBL = true;
+                if (normBR >  TOF_DEADBAND) respBR = true;
+            }
+            if (roll_err > IMU_DEADBAND) {
+                if (normFR >  TOF_DEADBAND) respFR = true;
+                if (normBR >  TOF_DEADBAND) respBR = true;
+                if (normFL < -TOF_DEADBAND) respFL = true;
+                if (normBL < -TOF_DEADBAND) respBL = true;
+            }
+            if (roll_err < -IMU_DEADBAND) {
+                if (normFR < -TOF_DEADBAND) respFR = true;
+                if (normBR < -TOF_DEADBAND) respBR = true;
+                if (normFL >  TOF_DEADBAND) respFL = true;
+                if (normBL >  TOF_DEADBAND) respBL = true;
+            }
+
+            // Revoke responsibility once terrain returns to flat
+            if (abs(normFL) <= TOF_DEADBAND) respFL = false;
+            if (abs(normFR) <= TOF_DEADBAND) respFR = false;
+            if (abs(normBL) <= TOF_DEADBAND) respBL = false;
+            if (abs(normBR) <= TOF_DEADBAND) respBR = false;
+
+            // Arduino Serial Plotter: Label:value pairs on one line
+            // Pitch/Roll   = error from baseline (degrees)
+            // ToF_xx       = distance delta from baseline (mm); positive = obstacle raised that corner
+            // Offset_xx    = servo correction angle applied to that leg (degrees)
+            Serial.printf("Pitch:%.2f Roll:%.2f ToF_FL:%d ToF_FR:%d ToF_BL:%d ToF_BR:%d Offset_FL:%.1f Offset_FR:%.1f Offset_BL:%.1f Offset_BR:%.1f\n",
+                          pitch_err, roll_err,
+                          normFL, normFR, normBL, normBR,
+                          offsetFL, offsetFR, offsetBL, offsetBR);
+
+            tof_read_state = 0;
+        }
+    }
+
+    // --- 4. Persist motor PWM every loop iteration ---
+    // Prevents PWM dropout caused by I2C bus activity or servo timer interference
+    ledcWrite(MOTOR_EN, currentMotorSpeed);
 }
