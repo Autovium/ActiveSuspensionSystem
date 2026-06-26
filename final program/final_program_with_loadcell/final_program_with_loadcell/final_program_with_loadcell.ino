@@ -63,7 +63,7 @@ struct SuccessiveAverage {
 #define PIN_MODE_41 41
 
 // NeoPixel LED Pin 
-#define PIN_NEOPIXEL 48 
+#define PIN_NEOPIXEL 48
 #define NUMPIXELS    1
 
 const int pwmFreq     = 5000;
@@ -124,7 +124,7 @@ float MAX_OFFSET   = 45.0;
 int   baseHeight   = 45;
 bool  auto_level   = false;
 
-float PID_KP = 7.5, PID_KI = 0.1, PID_KD = 1;
+float PID_KP = 5.5, PID_KI = 0.05, PID_KD = 0.8;
 
 struct LegPID {
     float output;
